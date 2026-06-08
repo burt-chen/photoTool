@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包 / 建置產物
+build/
+dist/
+*.spec
+build_log.txt
+
+# 測試用照片 / 對照表(避免把樣本資料 commit 進來)
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.csv
+*.xlsx
+*.xls
+
+# 系統 / 編輯器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
