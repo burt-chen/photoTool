@@ -8,6 +8,7 @@ MainWindow 同時支援獨立視窗 (root = tk.Tk) 與嵌入 Launcher 分頁
 """
 from __future__ import annotations
 
+import json
 import threading
 import traceback
 from datetime import datetime
@@ -20,6 +21,8 @@ from tkinter.scrolledtext import ScrolledText
 from PIL import Image, ImageTk
 
 from app.core import (
+    DATE_ERAS,
+    DATE_PATTERN_PRESETS,
     IMAGE_EXTS,
     META_FIELDS,
     POSITIONS,
@@ -29,12 +32,14 @@ from app.core import (
     annotate_image,
     available_fonts,
     build_mapping,
+    format_date,
     list_sheets,
     load_for_annotation,
     lookup_text,
     output_filename,
     read_photo_info,
     read_table,
+    render_thumbnail,
     save_image,
     text_from_meta,
 )
@@ -43,6 +48,9 @@ APP_TITLE = "照片批次加註工具"
 UI_FONT_SIZE = 11
 
 SEP_OPTIONS = [("換行", "\n"), ("空格", " "), ("逗號", ", "), ("斜線", " / "), ("自訂", None)]
+
+STYLES_PATH = Path.home() / ".phototool_styles.json"
+THUMB_BOX = 132  # 縮圖最長邊像素
 
 
 def _configure_global_fonts(size: int = UI_FONT_SIZE) -> None:
@@ -106,6 +114,127 @@ class ColorButton(ttk.Frame):
         self.btn.configure(state=state)
 
 
+class ThumbnailGrid(ttk.Frame):
+    """可捲動的縮圖牆(像檔案總管),點縮圖回呼 on_select(index)。
+
+    縮圖由外部以 set_thumb(i, PIL.Image) 逐張填入(背景產生),
+    本元件只負責版面、捲動、選取高亮與欄數重排。
+    """
+
+    CELL_W = THUMB_BOX + 18
+    CELL_H = THUMB_BOX + 38
+
+    def __init__(self, parent, on_select):
+        super().__init__(parent)
+        self._on_select = on_select
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(self, highlightthickness=0, background="#1e1e1e",
+                                width=2 * self.CELL_W + 24)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.inner = tk.Frame(self.canvas, background="#1e1e1e")
+        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vbar.grid(row=0, column=1, sticky="ns")
+        self.inner.bind("<Configure>",
+                        lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda _e: self._relayout())
+        self.canvas.bind("<Enter>", lambda _e: self._wheel(True))
+        self.canvas.bind("<Leave>", lambda _e: self._wheel(False))
+        self._cells: list[dict] = []
+        self._imgs: dict[int, ImageTk.PhotoImage] = {}
+        self._cols = 0
+        self._selected = -1
+        self._blank: ImageTk.PhotoImage | None = None
+
+    def _wheel(self, on: bool):
+        if on:
+            self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+        else:
+            self.canvas.unbind_all("<MouseWheel>")
+
+    def _on_wheel(self, event):
+        first, last = self.canvas.yview()
+        if last - first >= 1.0:
+            return
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def set_photos(self, paths):
+        for c in self._cells:
+            c["frame"].destroy()
+        self._cells.clear()
+        self._imgs.clear()
+        self._selected = -1
+        if self._blank is None:
+            ph = Image.new("RGB", (THUMB_BOX, int(THUMB_BOX * 0.72)), "#3a3a3a")
+            self._blank = ImageTk.PhotoImage(ph)
+        for i, p in enumerate(paths):
+            f = tk.Frame(self.inner, background="#1e1e1e",
+                         highlightthickness=2, highlightbackground="#1e1e1e")
+            img_lbl = tk.Label(f, image=self._blank, background="#000")
+            img_lbl.pack(padx=2, pady=2)
+            nm = tk.Label(f, text=Path(p).name, background="#1e1e1e", foreground="#ddd",
+                          width=18, anchor="center")
+            nm.pack()
+            for w in (f, img_lbl, nm):
+                w.bind("<Button-1>", lambda _e, idx=i: self._on_select(idx))
+            self._cells.append({"frame": f, "img": img_lbl})
+        self._cols = 0
+        self._relayout(force=True)
+
+    def set_thumb(self, i: int, pil_img):
+        if not (0 <= i < len(self._cells)):
+            return
+        photo = ImageTk.PhotoImage(pil_img)
+        self._imgs[i] = photo  # 保留參照,否則被 GC 後變空白
+        try:
+            self._cells[i]["img"].configure(image=photo)
+        except tk.TclError:
+            pass
+
+    def select(self, i: int):
+        if 0 <= self._selected < len(self._cells):
+            try:
+                self._cells[self._selected]["frame"].configure(highlightbackground="#1e1e1e")
+            except tk.TclError:
+                pass
+        self._selected = i
+        if 0 <= i < len(self._cells):
+            try:
+                self._cells[i]["frame"].configure(highlightbackground="#4da3ff")
+            except tk.TclError:
+                pass
+            self._ensure_visible(i)
+
+    def _ensure_visible(self, i: int):
+        self.update_idletasks()
+        try:
+            cell = self._cells[i]["frame"]
+            y, h = cell.winfo_y(), cell.winfo_height()
+            total = self.inner.winfo_height()
+            view_h = self.canvas.winfo_height()
+            if total <= 0 or view_h <= 0:
+                return
+            top, bot = self.canvas.yview()
+            if y / total < top:
+                self.canvas.yview_moveto(y / total)
+            elif (y + h) / total > bot:
+                self.canvas.yview_moveto(max(0.0, (y + h) / total - view_h / total))
+        except (tk.TclError, ZeroDivisionError):
+            pass
+
+    def _relayout(self, force: bool = False):
+        w = self.canvas.winfo_width()
+        cols = max(1, w // self.CELL_W)
+        if cols == self._cols and not force:
+            return
+        self._cols = cols
+        for idx, c in enumerate(self._cells):
+            r, cc = divmod(idx, cols)
+            c["frame"].grid(row=r, column=cc, padx=4, pady=4)
+
+
 class MainWindow:
     def __init__(self, root, embedded: bool = False):
         self.root = root
@@ -125,6 +254,9 @@ class MainWindow:
         self._mapping: dict[str, str] | None = None
         self._preview_imgtk = None
         self._running = False
+        self._preview_index = -1
+        self._thumb_gen = 0
+        self._thumb_sig = None
 
         # 避免滑鼠滾輪停在 Combobox 上誤改值
         try:
@@ -281,9 +413,35 @@ class MainWindow:
         self.sep_custom_var = tk.StringVar(value="")
         self.sep_custom_entry = ttk.Entry(sep_row, textvariable=self.sep_custom_var, width=10, state="disabled")
         self.sep_custom_entry.pack(side="left")
+
+        # 日期格式(套用到「拍攝日期 / 拍攝日期時間」)
+        date_box = ttk.LabelFrame(fr, text="日期格式(套用到拍攝日期 / 拍攝日期時間)")
+        date_box.grid(row=3, column=0, sticky="ew", padx=6, pady=(2, 6))
+        ttk.Label(date_box, text="年制:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.date_era_var = tk.StringVar(value="西元")
+        era_row = ttk.Frame(date_box)
+        era_row.grid(row=0, column=1, sticky="w", pady=4)
+        for e in DATE_ERAS:
+            ttk.Radiobutton(era_row, text=e, value=e, variable=self.date_era_var,
+                            command=self._update_date_example).pack(side="left", padx=(0, 8))
+        ttk.Label(date_box, text="格式:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.date_pattern_var = tk.StringVar(value="YYYY-MM-DD")
+        self.date_pattern_cb = ttk.Combobox(date_box, textvariable=self.date_pattern_var,
+                                            values=DATE_PATTERN_PRESETS, width=22)
+        self.date_pattern_cb.grid(row=1, column=1, sticky="w", pady=4)
+        self.date_pattern_cb.bind("<<ComboboxSelected>>", lambda _e: self._update_date_example())
+        self.date_pattern_var.trace_add("write", lambda *_: self._update_date_example())
+        self.date_example_var = tk.StringVar(value="")
+        ttk.Label(date_box, textvariable=self.date_example_var, foreground="#1976d2").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(date_box, foreground="#666",
+                  text="可用代碼:YYYY 年(民國自動換算) MM 月 DD 日 HH:mm:ss 時分秒").grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+
         ttk.Label(fr, foreground="#666",
                   text="提示:GPS / 拍攝日期需照片本身含 EXIF 資訊才讀得到。").grid(
-            row=3, column=0, sticky="w", padx=6, pady=(0, 6))
+            row=4, column=0, sticky="w", padx=6, pady=(0, 6))
+        self._update_date_example()
         return fr
 
     # ---- Tab 3: 樣式與位置 ----
@@ -366,39 +524,69 @@ class MainWindow:
         ttk.Spinbox(s3, from_=0, to=25, increment=0.5, width=6,
                     textvariable=self.margin_var).grid(row=0, column=2, sticky="w")
 
+        # 我的樣式(把以上所有設定存成具名樣式,下次一鍵套用)
+        s4 = ttk.LabelFrame(page, text="我的樣式")
+        s4.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(s4, text="已存樣式:").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self.saved_style_var = tk.StringVar()
+        self.saved_style_cb = ttk.Combobox(s4, textvariable=self.saved_style_var,
+                                           state="readonly", width=22, values=[])
+        self.saved_style_cb.grid(row=0, column=1, sticky="w", padx=4, pady=6)
+        ttk.Button(s4, text="套用", command=self._apply_saved_style).grid(row=0, column=2, padx=2, pady=6)
+        ttk.Button(s4, text="另存新樣式…", command=self._save_new_style).grid(row=0, column=3, padx=2, pady=6)
+        ttk.Button(s4, text="覆蓋更新", command=self._overwrite_style).grid(row=0, column=4, padx=2, pady=6)
+        ttk.Button(s4, text="刪除", command=self._delete_style).grid(row=0, column=5, padx=2, pady=6)
+
         self._on_preset_changed()
         self._on_size_mode_changed()
+        self._refresh_saved_styles()
         return page
 
     # ---- Tab 4: 預覽 / 輸出 ----
     def _build_output_tab(self, parent):
         page = ttk.Frame(parent)
         page.columnconfigure(0, weight=1)
-        page.rowconfigure(1, weight=1)
+        page.rowconfigure(0, weight=1)
 
-        prev_bar = ttk.Frame(page)
-        prev_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        ttk.Label(prev_bar, text="預覽照片:").pack(side="left")
-        self.preview_pick_var = tk.StringVar()
-        self.preview_pick_cb = ttk.Combobox(prev_bar, textvariable=self.preview_pick_var,
-                                            state="readonly", width=40)
-        self.preview_pick_cb.pack(side="left", padx=(4, 6))
-        self.preview_pick_cb.bind("<<ComboboxSelected>>", lambda _e: self._update_preview())
-        ttk.Button(prev_bar, text="更新預覽", command=self._update_preview).pack(side="left")
+        # 上半:縮圖牆(左) | 大圖預覽(右),可拖曳分隔
+        split = ttk.Panedwindow(page, orient="horizontal")
+        split.grid(row=0, column=0, sticky="nsew")
+
+        left = ttk.LabelFrame(split, text="縮圖(點選檢視大圖)")
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+        thumb_bar = ttk.Frame(left)
+        thumb_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Button(thumb_bar, text="重新整理縮圖", command=self._refresh_thumbs).pack(side="left", padx=4, pady=2)
+        self.thumb_status = tk.StringVar(value="")
+        ttk.Label(thumb_bar, textvariable=self.thumb_status, foreground="#1976d2").pack(side="left", padx=(4, 0))
+        self.thumb_grid = ThumbnailGrid(left, on_select=self._on_thumb_click)
+        self.thumb_grid.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        split.add(left, weight=1)
+
+        right = ttk.LabelFrame(split, text="預覽")
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+        nav = ttk.Frame(right)
+        nav.grid(row=0, column=0, sticky="ew", pady=2)
+        ttk.Button(nav, text="⏮ 第一張", command=lambda: self._nav("first")).pack(side="left", padx=2)
+        ttk.Button(nav, text="◀ 上一張", command=lambda: self._nav("prev")).pack(side="left", padx=2)
+        self.nav_pos_var = tk.StringVar(value="- / -")
+        ttk.Label(nav, textvariable=self.nav_pos_var, width=9, anchor="center").pack(side="left", padx=4)
+        ttk.Button(nav, text="下一張 ▶", command=lambda: self._nav("next")).pack(side="left", padx=2)
+        ttk.Button(nav, text="最後一張 ⏭", command=lambda: self._nav("last")).pack(side="left", padx=2)
+        ttk.Button(nav, text="更新預覽", command=self._update_preview).pack(side="left", padx=(12, 2))
+        self.preview_label = tk.Label(right, background="#2b2b2b", anchor="center",
+                                      text="(加入照片後,點縮圖或按「更新預覽」)", foreground="#ccc")
+        self.preview_label.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         self.preview_info = tk.StringVar(value="")
-        ttk.Label(prev_bar, textvariable=self.preview_info, foreground="#1976d2").pack(side="left", padx=(10, 0))
+        ttk.Label(right, textvariable=self.preview_info, foreground="#1976d2").grid(
+            row=2, column=0, sticky="w", padx=6, pady=(0, 4))
+        split.add(right, weight=2)
 
-        prev_box = ttk.LabelFrame(page, text="預覽")
-        prev_box.grid(row=1, column=0, sticky="nsew")
-        prev_box.rowconfigure(0, weight=1)
-        prev_box.columnconfigure(0, weight=1)
-        self.preview_label = tk.Label(prev_box, background="#2b2b2b", anchor="center",
-                                      text="(選好照片與設定後,按「更新預覽」)", foreground="#ccc")
-        self.preview_label.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-
-        # 輸出設定
+        # 下半:輸出設定
         out_box = ttk.LabelFrame(page, text="輸出設定")
-        out_box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        out_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         out_box.columnconfigure(1, weight=1)
 
         ttk.Label(out_box, text="輸出資料夾:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
@@ -440,9 +628,9 @@ class MainWindow:
         ttk.Label(run_row, textvariable=self.status_var, width=24).grid(row=0, column=3)
 
         log_box = ttk.LabelFrame(page, text="日誌")
-        log_box.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        log_box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         log_box.columnconfigure(0, weight=1)
-        self.log_text = ScrolledText(log_box, height=6, wrap="word", state="disabled")
+        self.log_text = ScrolledText(log_box, height=5, wrap="word", state="disabled")
         self.log_text.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
         return page
 
@@ -453,7 +641,7 @@ class MainWindow:
         except tk.TclError:
             return
         if idx == 3:
-            self._refresh_preview_choices()
+            self._enter_preview_tab()
 
     def _on_mode_changed(self):
         mode = self.mode_var.get()
@@ -464,6 +652,17 @@ class MainWindow:
     def _on_sep_changed(self):
         is_custom = self.sep_var.get() == "自訂"
         self.sep_custom_entry.configure(state="normal" if is_custom else "disabled")
+
+    def _date_opts(self) -> dict:
+        return {"era": self.date_era_var.get(), "pattern": self.date_pattern_var.get()}
+
+    def _update_date_example(self):
+        sample = datetime(2026, 6, 9, 14, 30, 5)
+        try:
+            txt = format_date(sample, self.date_pattern_var.get(), self.date_era_var.get())
+        except Exception:
+            txt = ""
+        self.date_example_var.set(f"範例:{txt}")
 
     def _on_preset_changed(self):
         name = self.preset_var.get()
@@ -522,14 +721,24 @@ class MainWindow:
         self._append_photos(paths)
 
     def _add_folder(self):
-        d = filedialog.askdirectory(title="選擇照片資料夾")
-        if not d:
-            return
-        base = Path(d)
-        it = base.rglob("*") if self.recursive_var.get() else base.glob("*")
-        found = [str(p) for p in it if p.suffix.lower() in IMAGE_EXTS and p.is_file()]
-        found.sort()
-        self._append_photos(found)
+        """可連續選取多個資料夾:選一個加一個,按取消結束。"""
+        picked = 0
+        last_dir = ""
+        while True:
+            title = ("選擇照片資料夾(可連續選多個,取消結束)"
+                     if picked == 0 else f"已加 {picked} 個資料夾,繼續選下一個(取消結束)")
+            d = filedialog.askdirectory(title=title, initialdir=last_dir or None)
+            if not d:
+                break
+            last_dir = str(Path(d).parent)
+            base = Path(d)
+            it = base.rglob("*") if self.recursive_var.get() else base.glob("*")
+            found = sorted(str(p) for p in it
+                           if p.suffix.lower() in IMAGE_EXTS and p.is_file())
+            self._append_photos(found)
+            picked += 1
+        if picked:
+            self._log(f"共處理 {picked} 個資料夾")
 
     def _append_photos(self, paths):
         existing = set(self.photos)
@@ -663,6 +872,131 @@ class MainWindow:
             margin_percent=self.margin_var.get(),
         )
 
+    # ------------------------------------------------------------- 我的樣式 --
+    def _collect_style_dict(self) -> dict:
+        """把目前樣式分頁的所有設定收成可序列化的 dict。"""
+        path, idx = self._resolve_font()
+        return {
+            "font_name": self.font_var.get(),
+            "font_path": path,
+            "font_index": idx,
+            "preset": self.preset_var.get(),
+            "fill": self.fill_btn.color(),
+            "stroke_on": bool(self.stroke_on_var.get()),
+            "stroke": self.stroke_btn.color(),
+            "stroke_ratio": float(self.stroke_ratio_var.get()),
+            "size_mode": self.size_mode_var.get(),
+            "size_percent": float(self.size_percent_var.get()),
+            "size_px": int(self.size_px_var.get()),
+            "position": self.position_var.get(),
+            "margin_percent": float(self.margin_var.get()),
+        }
+
+    def _apply_style_dict(self, d: dict):
+        """把存下來的樣式 dict 套回 UI。"""
+        name = d.get("font_name", "")
+        known = [f[0] for f in self._fonts]
+        if name in known:
+            self.font_var.set(name)
+        elif d.get("font_path"):
+            # 還原自訂字型
+            self._custom_font = (d["font_path"], int(d.get("font_index", 0)))
+            disp = name if name.startswith("自訂:") else f"自訂:{Path(d['font_path']).name}"
+            vals = [v for v in list(self.font_cb["values"]) if not v.startswith("自訂:")]
+            vals.append(disp)
+            self.font_cb.configure(values=vals)
+            self.font_var.set(disp)
+        self.preset_var.set(d.get("preset", "自訂"))
+        self.fill_btn.set_color(d.get("fill", "#FFFFFF"))
+        self.stroke_on_var.set(bool(d.get("stroke_on", True)))
+        self.stroke_btn.set_color(d.get("stroke", "#000000"))
+        self.stroke_ratio_var.set(float(d.get("stroke_ratio", 12.0)))
+        self.size_mode_var.set(d.get("size_mode", "auto"))
+        self.size_percent_var.set(float(d.get("size_percent", 4.0)))
+        self.size_px_var.set(int(d.get("size_px", 48)))
+        self.position_var.set(d.get("position", "左下"))
+        self.margin_var.set(float(d.get("margin_percent", 3.0)))
+        # 還原啟用狀態(顏色鈕鎖定 / 大小欄位)
+        self._on_preset_changed()
+        self._on_size_mode_changed()
+
+    @staticmethod
+    def _load_styles_file() -> dict:
+        if STYLES_PATH.exists():
+            try:
+                data = json.loads(STYLES_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return {}
+
+    def _save_styles_file(self, data: dict):
+        try:
+            STYLES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("存檔失敗", f"無法寫入樣式檔:\n{e}")
+
+    def _refresh_saved_styles(self, select: str | None = None):
+        data = self._load_styles_file()
+        names = sorted(data.keys())
+        self.saved_style_cb.configure(values=names)
+        if select and select in names:
+            self.saved_style_var.set(select)
+        elif self.saved_style_var.get() not in names:
+            self.saved_style_var.set(names[0] if names else "")
+
+    def _apply_saved_style(self):
+        name = self.saved_style_var.get()
+        if not name:
+            messagebox.showinfo("提示", "目前沒有已存樣式")
+            return
+        data = self._load_styles_file()
+        if name in data:
+            self._apply_style_dict(data[name])
+            self._log(f"已套用樣式「{name}」")
+
+    def _save_new_style(self):
+        from tkinter import simpledialog
+        name = simpledialog.askstring("另存樣式", "樣式名稱:", parent=self.root)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        data = self._load_styles_file()
+        if name in data and not messagebox.askyesno("覆蓋", f"樣式「{name}」已存在,要覆蓋?"):
+            return
+        data[name] = self._collect_style_dict()
+        self._save_styles_file(data)
+        self._refresh_saved_styles(select=name)
+        self._log(f"已儲存樣式「{name}」")
+
+    def _overwrite_style(self):
+        name = self.saved_style_var.get()
+        if not name:
+            messagebox.showinfo("提示", "請先選一個要覆蓋的樣式,或用「另存新樣式」")
+            return
+        if not messagebox.askyesno("覆蓋更新", f"用目前設定覆蓋樣式「{name}」?"):
+            return
+        data = self._load_styles_file()
+        data[name] = self._collect_style_dict()
+        self._save_styles_file(data)
+        self._log(f"已更新樣式「{name}」")
+
+    def _delete_style(self):
+        name = self.saved_style_var.get()
+        if not name:
+            return
+        if not messagebox.askyesno("刪除", f"刪除樣式「{name}」?"):
+            return
+        data = self._load_styles_file()
+        data.pop(name, None)
+        self._save_styles_file(data)
+        self._refresh_saved_styles()
+        self._log(f"已刪除樣式「{name}」")
+
     def _text_params(self) -> dict:
         """在 UI 執行緒蒐集決定文字的所有設定,打包成純資料。
 
@@ -674,6 +1008,7 @@ class MainWindow:
             "mapping": self._mapping,
             "meta_fields": [key for _lbl, key in META_FIELDS if self.meta_vars[key].get()],
             "sep": self._meta_sep(),
+            "date_opts": self._date_opts(),
         }
 
     @staticmethod
@@ -686,7 +1021,8 @@ class MainWindow:
             m = params["mapping"]
             return (lookup_text(m, photo_path) or "") if m else ""
         info = read_photo_info(photo_path)
-        return text_from_meta(info, params["meta_fields"], params["sep"])
+        return text_from_meta(info, params["meta_fields"], params["sep"],
+                              params.get("date_opts"))
 
     def _compute_text(self, photo_path: str) -> str:
         return self._text_for(photo_path, self._text_params())
@@ -701,24 +1037,37 @@ class MainWindow:
         return "\n"
 
     # --------------------------------------------------------------- 預覽 --
-    def _refresh_preview_choices(self):
-        names = [Path(p).name for p in self.photos]
-        self.preview_pick_cb.configure(values=names)
-        if names and self.preview_pick_var.get() not in names:
-            self.preview_pick_var.set(names[0])
+    def _enter_preview_tab(self):
+        """切到預覽分頁:照片清單有變動才重建縮圖,否則沿用。"""
+        sig = tuple(self.photos)
+        if sig != self._thumb_sig:
+            self._refresh_thumbs()
+        elif self.photos and self._preview_index < 0:
+            self._show_index(0)
 
-    def _current_preview_path(self) -> str | None:
-        name = self.preview_pick_var.get()
-        for p in self.photos:
-            if Path(p).name == name:
-                return p
-        return self.photos[0] if self.photos else None
-
-    def _update_preview(self):
-        path = self._current_preview_path()
-        if not path:
+    def _nav(self, where: str):
+        n = len(self.photos)
+        if n == 0:
             messagebox.showinfo("提示", "請先到「照片」分頁加入照片")
             return
+        cur = self._preview_index if self._preview_index >= 0 else 0
+        target = {"first": 0, "last": n - 1,
+                  "prev": max(0, cur - 1), "next": min(n - 1, cur + 1)}[where]
+        self._show_index(target)
+
+    def _on_thumb_click(self, i: int):
+        self._show_index(i)
+
+    def _show_index(self, i: int):
+        n = len(self.photos)
+        if not (0 <= i < n):
+            return
+        self._preview_index = i
+        self.nav_pos_var.set(f"{i + 1} / {n}")
+        self.thumb_grid.select(i)
+        self._render_preview(self.photos[i])
+
+    def _render_preview(self, path: str):
         try:
             style = self._build_style()
             img = load_for_annotation(path)
@@ -727,17 +1076,76 @@ class MainWindow:
         except Exception as e:
             messagebox.showerror("預覽失敗", f"{e}\n\n{traceback.format_exc()}")
             return
-
-        # 縮放以符合預覽區(用實際 widget 尺寸,初次太小則用預設)
         self.preview_label.update_idletasks()
-        avail_w = max(self.preview_label.winfo_width() - 8, 480)
-        avail_h = max(self.preview_label.winfo_height() - 8, 360)
+        avail_w = max(self.preview_label.winfo_width() - 8, 400)
+        avail_h = max(self.preview_label.winfo_height() - 8, 320)
         disp = img.copy()
         disp.thumbnail((avail_w, avail_h), Image.LANCZOS)
         self._preview_imgtk = ImageTk.PhotoImage(disp)
         self.preview_label.configure(image=self._preview_imgtk, text="")
         note = "(此張無文字)" if not text else ""
         self.preview_info.set(f"{Path(path).name} — 原圖 {img.width}×{img.height} {note}".strip())
+
+    def _update_preview(self):
+        """重新渲染目前這張(設定改了之後按此即時更新大圖)。"""
+        if not self.photos:
+            messagebox.showinfo("提示", "請先到「照片」分頁加入照片")
+            return
+        i = self._preview_index if self._preview_index >= 0 else 0
+        self._show_index(i)
+
+    def _refresh_thumbs(self):
+        """(重新)產生整牆縮圖。背景逐張渲染,用世代計數作廢過期的工作。"""
+        photos = list(self.photos)
+        self._thumb_sig = tuple(photos)
+        self.thumb_grid.set_photos(photos)
+        self._preview_index = -1
+        self.nav_pos_var.set("- / -" if not photos else f"1 / {len(photos)}")
+        if not photos:
+            self.thumb_status.set("尚無照片")
+            self.preview_label.configure(image="", text="(加入照片後,點縮圖或按「更新預覽」)")
+            return
+        try:
+            style = self._build_style()
+        except Exception:
+            style = None
+        params = self._text_params()
+        self._thumb_gen += 1
+        gen = self._thumb_gen
+        total = len(photos)
+        self.thumb_status.set(f"產生縮圖 0/{total}…")
+
+        def worker():
+            for i, src in enumerate(photos):
+                if gen != self._thumb_gen:
+                    return
+                try:
+                    text = self._text_for(src, params) if style is not None else ""
+                    img = render_thumbnail(src, THUMB_BOX, text, style)
+                except Exception:
+                    img = None
+                if img is not None:
+                    self._post(lambda i=i, img=img: self.thumb_grid.set_thumb(i, img))
+                done = i + 1
+                if done % 4 == 0 or done == total:
+                    self._post(lambda d=done: self.thumb_status.set(
+                        f"產生縮圖 {d}/{total}…" if d < total else f"縮圖完成,共 {d} 張"))
+            self._post(lambda: self._after_thumbs(gen))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_thumbs(self, gen: int):
+        if gen != self._thumb_gen:
+            return
+        if self.photos and self._preview_index < 0:
+            self._show_index(0)
+
+    def _post(self, fn):
+        """從背景執行緒安排到 UI 執行緒;若視窗已銷毀則靜默略過。"""
+        try:
+            self.root.after(0, fn)
+        except (tk.TclError, RuntimeError):
+            pass
 
     # --------------------------------------------------------------- 批次 --
     def _run_batch(self):

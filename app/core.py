@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from PIL import ExifTags, Image, ImageDraw, ImageFont, ImageOps
@@ -168,6 +169,46 @@ META_FIELDS = [
 META_LABEL_OF = {k: lbl for lbl, k in META_FIELDS}
 
 
+# 日期格式 — 範本可用 token: YYYY(年,民國時自動換算)/MM/DD/HH/mm/ss
+DATE_ERAS = ["西元", "民國"]
+DATE_PATTERN_PRESETS = [
+    "YYYY-MM-DD",
+    "YYYY/MM/DD",
+    "YYYY年MM月DD日",
+    "YYYY.MM.DD",
+    "MM/DD",
+]
+
+
+def format_date(dt: datetime | None, pattern: str = "YYYY-MM-DD",
+                era: str = "西元", with_time: bool = False) -> str:
+    """依範本把 datetime 格式化;era='民國' 時年份自動換算(西元-1911)。"""
+    if dt is None:
+        return ""
+    year = dt.year if era != "民國" else dt.year - 1911
+    out = pattern or "YYYY-MM-DD"
+    # 先換多字 token,避免短 token 先被吃掉
+    out = out.replace("YYYY", str(year))
+    out = out.replace("MM", f"{dt.month:02d}")
+    out = out.replace("DD", f"{dt.day:02d}")
+    out = out.replace("HH", f"{dt.hour:02d}")
+    out = out.replace("mm", f"{dt.minute:02d}")
+    out = out.replace("ss", f"{dt.second:02d}")
+    if with_time:
+        out = f"{out} {dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+    return out
+
+
+def _parse_exif_dt(s) -> datetime | None:
+    s = str(s).strip()
+    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y:%m:%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _gps_to_deg(value, ref) -> float | None:
     try:
         d, m, s = value
@@ -191,6 +232,7 @@ def read_photo_info(path: str) -> dict:
         "lat": None,
         "lon": None,
         "gps": "",
+        "_dt": None,   # 解析後的 datetime 物件,供自訂日期格式 / 民國年用
     }
     try:
         with Image.open(path) as im:
@@ -209,6 +251,7 @@ def read_photo_info(path: str) -> dict:
         info["date"] = date_part
         info["time"] = time_part
         info["datetime"] = (date_part + " " + time_part).strip()
+        info["_dt"] = _parse_exif_dt(s)
 
     try:
         gps = exif.get_ifd(_TAG_GPSINFO)
@@ -224,15 +267,31 @@ def read_photo_info(path: str) -> dict:
     return info
 
 
-def text_from_meta(info: dict, fields: list[str], sep: str = "\n") -> str:
-    """依選取的欄位順序組合文字;空值欄位略過。"""
+def _meta_value(info: dict, key: str, date_opts: dict | None):
+    """取得單一欄位的顯示字串;date / datetime 在有 date_opts 時套用自訂格式。"""
+    dt = info.get("_dt")
+    if date_opts and dt is not None and key in ("date", "datetime"):
+        pattern = date_opts.get("pattern", "YYYY-MM-DD")
+        era = date_opts.get("era", "西元")
+        return format_date(dt, pattern, era, with_time=(key == "datetime"))
+    v = info.get(key)
+    if isinstance(v, float):
+        return f"{v:.6f}"
+    return v
+
+
+def text_from_meta(info: dict, fields: list[str], sep: str = "\n",
+                   date_opts: dict | None = None) -> str:
+    """依選取的欄位順序組合文字;空值欄位略過。
+
+    date_opts={"era":"西元"/"民國", "pattern":"YYYY年MM月DD日"} 時,
+    「拍攝日期 / 拍攝日期時間」會套用此格式(其他欄位不受影響)。
+    """
     parts: list[str] = []
     for key in fields:
-        v = info.get(key)
+        v = _meta_value(info, key, date_opts)
         if v is None or v == "":
             continue
-        if isinstance(v, float):
-            v = f"{v:.6f}"
         parts.append(str(v))
     return sep.join(parts)
 
@@ -361,3 +420,23 @@ def load_for_annotation(src_path: str) -> Image.Image:
     with Image.open(src_path) as im:
         im = ImageOps.exif_transpose(im)
         return im.copy()
+
+
+def render_thumbnail(src_path: str, box: int, text: str = "",
+                     style: "TextStyle | None" = None) -> Image.Image:
+    """產生縮圖(最長邊 box 像素);有 text/style 時把文字也畫上去。
+
+    用 draft() 先讓 JPEG 以縮小尺寸解碼,大幅加速大量縮圖產生。
+    """
+    with Image.open(src_path) as im:
+        try:
+            im.draft("RGB", (box * 2, box * 2))
+        except Exception:
+            pass
+        im = ImageOps.exif_transpose(im)
+        if im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGB")
+        im.thumbnail((box, box), Image.LANCZOS)
+        if text and style is not None:
+            annotate_image(im, text, style)
+        return im
