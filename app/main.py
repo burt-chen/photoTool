@@ -272,8 +272,8 @@ class ThumbnailGrid(ttk.Frame):
             img_lbl = tk.Label(f, image=self._blank, background="#000")
             img_lbl.pack(padx=2, pady=2)
             nm = tk.Label(f, text=Path(p).name, background="#1e1e1e", foreground="#ddd",
-                          width=18, anchor="center")
-            nm.pack()
+                          wraplength=THUMB_BOX + 8, justify="center")
+            nm.pack(fill="x")
             for w in (f, img_lbl, nm):
                 w.bind("<Button-1>", lambda _e, idx=i: self._on_select(idx))
             self._cells.append({"frame": f, "img": img_lbl})
