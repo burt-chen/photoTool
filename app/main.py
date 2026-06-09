@@ -395,10 +395,12 @@ class MainWindow:
         list_box.rowconfigure(0, weight=1)
         list_box.columnconfigure(0, weight=1)
         self.photo_list = tk.Listbox(list_box, selectmode="extended", activestyle="none")
-        self.photo_list.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.photo_list.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=(4, 0))
         sb = ttk.Scrollbar(list_box, orient="vertical", command=self.photo_list.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self.photo_list.configure(yscrollcommand=sb.set)
+        sb.grid(row=0, column=1, sticky="ns", pady=(4, 0))
+        hsb = ttk.Scrollbar(list_box, orient="horizontal", command=self.photo_list.xview)
+        hsb.grid(row=1, column=0, sticky="ew", padx=(4, 0))
+        self.photo_list.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
 
         tip = ("流程:加入照片 → 設定文字內容 → 調樣式與位置 → 預覽確認後輸出。\n"
                "支援 jpg / png / bmp / tif / webp。")
@@ -845,7 +847,7 @@ class MainWindow:
         for p in paths:
             if p not in existing:
                 self.photos.append(p)
-                self.photo_list.insert("end", Path(p).name)
+                self.photo_list.insert("end", p)
                 existing.add(p)
                 added += 1
         self._update_count()
