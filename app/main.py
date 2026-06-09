@@ -114,6 +114,103 @@ class ColorButton(ttk.Frame):
         self.btn.configure(state=state)
 
 
+class MultiFolderDialog(tk.Toplevel):
+    """在同一上層資料夾底下,用 Ctrl/Shift 一次複選多個子資料夾。
+
+    tkinter / Windows 原生資料夾對話框只能單選,故自製此對話框:
+    先選「上層資料夾」,列出其下所有子資料夾,再用清單複選(像上傳的多選)。
+    結果放在 self.result(list[str] 或 None=取消)。
+    """
+
+    def __init__(self, parent, initial_dir: str = ""):
+        super().__init__(parent)
+        self.title("選擇資料夾(可複選)")
+        self.result: list[str] | None = None
+        self._subdirs: list[Path] = []
+        self._parent_dir = ""
+
+        try:
+            self.transient(parent.winfo_toplevel())
+        except tk.TclError:
+            pass
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(top, text="上層資料夾:").pack(side="left")
+        self.parent_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.parent_var, state="readonly").pack(
+            side="left", fill="x", expand=True, padx=(4, 4))
+        ttk.Button(top, text="瀏覽…", command=self._browse_parent).pack(side="left")
+
+        ttk.Label(self, text="子資料夾(按住 Ctrl / Shift 可複選):").pack(
+            anchor="w", padx=10, pady=(4, 0))
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True, padx=10, pady=4)
+        self.listbox = tk.Listbox(mid, selectmode="extended", activestyle="none", height=16)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.listbox.yview)
+        sb.pack(side="right", fill="y")
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.bind("<<ListboxSelect>>", lambda _e: self._update_count())
+        self.listbox.bind("<Double-Button-1>", lambda _e: self._ok())
+
+        self.incl_self_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self, text="也包含上層資料夾本身的照片",
+                        variable=self.incl_self_var).pack(anchor="w", padx=10)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=(6, 10))
+        ttk.Button(btns, text="全選", command=lambda: self.listbox.select_set(0, "end") or self._update_count()).pack(side="left")
+        ttk.Button(btns, text="全不選", command=lambda: self.listbox.select_clear(0, "end") or self._update_count()).pack(side="left", padx=(4, 0))
+        self.count_var = tk.StringVar(value="已選 0 個")
+        ttk.Label(btns, textvariable=self.count_var, foreground="#1976d2").pack(side="left", padx=(10, 0))
+        ttk.Button(btns, text="取消", command=self._cancel).pack(side="right")
+        ttk.Button(btns, text="確定加入", command=self._ok).pack(side="right", padx=(0, 6))
+
+        self.geometry("520x560")
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        if initial_dir and Path(initial_dir).is_dir():
+            self._load_parent(initial_dir)
+
+    def _browse_parent(self):
+        d = filedialog.askdirectory(title="選擇上層資料夾", parent=self,
+                                    initialdir=self._parent_dir or None)
+        if d:
+            self._load_parent(d)
+
+    def _load_parent(self, d: str):
+        self._parent_dir = d
+        self.parent_var.set(d)
+        self.listbox.delete(0, "end")
+        try:
+            self._subdirs = sorted((p for p in Path(d).iterdir() if p.is_dir()),
+                                   key=lambda p: p.name.lower())
+        except OSError:
+            self._subdirs = []
+        for p in self._subdirs:
+            self.listbox.insert("end", p.name)
+        self._update_count()
+
+    def _update_count(self):
+        self.count_var.set(f"已選 {len(self.listbox.curselection())} 個")
+
+    def _ok(self):
+        chosen = [str(self._subdirs[i]) for i in self.listbox.curselection()]
+        if self.incl_self_var.get() and self._parent_dir:
+            chosen.insert(0, self._parent_dir)
+        if not chosen:
+            messagebox.showinfo("提示", "請至少選一個資料夾(或勾選包含上層本身)", parent=self)
+            return
+        self.result = chosen
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class ThumbnailGrid(ttk.Frame):
     """可捲動的縮圖牆(像檔案總管),點縮圖回呼 on_select(index)。
 
@@ -721,24 +818,26 @@ class MainWindow:
         self._append_photos(paths)
 
     def _add_folder(self):
-        """可連續選取多個資料夾:選一個加一個,按取消結束。"""
-        picked = 0
-        last_dir = ""
-        while True:
-            title = ("選擇照片資料夾(可連續選多個,取消結束)"
-                     if picked == 0 else f"已加 {picked} 個資料夾,繼續選下一個(取消結束)")
-            d = filedialog.askdirectory(title=title, initialdir=last_dir or None)
-            if not d:
-                break
-            last_dir = str(Path(d).parent)
+        """在同一上層資料夾下複選多個子資料夾(像上傳的多選方式)。"""
+        dlg = MultiFolderDialog(self.root, initial_dir=getattr(self, "_last_folder_parent", ""))
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        self.root.wait_window(dlg)
+        folders = dlg.result
+        if not folders:
+            return
+        self._last_folder_parent = str(Path(folders[0]).parent)
+        recursive = self.recursive_var.get()
+        before = len(self.photos)
+        for d in folders:
             base = Path(d)
-            it = base.rglob("*") if self.recursive_var.get() else base.glob("*")
+            it = base.rglob("*") if recursive else base.glob("*")
             found = sorted(str(p) for p in it
                            if p.suffix.lower() in IMAGE_EXTS and p.is_file())
             self._append_photos(found)
-            picked += 1
-        if picked:
-            self._log(f"共處理 {picked} 個資料夾")
+        self._log(f"從 {len(folders)} 個資料夾共加入 {len(self.photos) - before} 張照片")
 
     def _append_photos(self, paths):
         existing = set(self.photos)
